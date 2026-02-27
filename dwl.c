@@ -144,6 +144,7 @@ typedef struct {
 	uint32_t tags;
 	int isfloating, isurgent, isfullscreen;
 	uint32_t resize; /* configure serial of a pending resize */
+	struct wl_list link_temp;
 } Client;
 
 typedef struct {
@@ -244,7 +245,14 @@ typedef struct {
 	struct wl_listener destroy;
 } SessionLock;
 
+typedef struct {
+	int x;
+	int y;
+} Vector;
+
+
 /* function declarations */
+static void addscratchpad(const Arg *arg);
 static void applybounds(Client *c, struct wlr_box *bbox);
 static void applyrules(Client *c);
 static void arrange(Monitor *m);
@@ -295,9 +303,11 @@ static void focusclient(Client *c, int lift);
 static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
 static void focusdir(const Arg *arg);
+static void swapdir(const Arg *arg);
 static Client *focustop(Monitor *m);
 static void fullscreennotify(struct wl_listener *listener, void *data);
 static void gpureset(struct wl_listener *listener, void *data);
+static void gaplessgrid(Monitor *m);
 static void handlesig(int signo);
 static void incnmaster(const Arg *arg);
 static void inputdevice(struct wl_listener *listener, void *data);
@@ -324,6 +334,7 @@ static void printstatus(void);
 static void powermgrsetmode(struct wl_listener *listener, void *data);
 static void quit(const Arg *arg);
 static void rendermon(struct wl_listener *listener, void *data);
+static void removescratchpad(const Arg *arg);
 static void requestdecorationmode(struct wl_listener *listener, void *data);
 static void requeststartdrag(struct wl_listener *listener, void *data);
 static void requestmonstate(struct wl_listener *listener, void *data);
@@ -351,6 +362,7 @@ static void tablettooltip(struct wl_listener *listener, void *data);
 static void tile(Monitor *m);
 static void togglefloating(const Arg *arg);
 static void togglefullscreen(const Arg *arg);
+static void togglescratchpad(const Arg *arg);
 static void toggletag(const Arg *arg);
 static void toggleview(const Arg *arg);
 static void unlocksession(struct wl_listener *listener, void *data);
@@ -464,6 +476,9 @@ static struct wl_listener request_start_drag = {.notify = requeststartdrag};
 static struct wl_listener start_drag = {.notify = startdrag};
 static struct wl_listener new_session_lock = {.notify = locksession};
 
+static struct wl_list scratchpad_clients;
+static int scratchpad_visible = 1;
+
 #ifdef XWAYLAND
 static void activatex11(struct wl_listener *listener, void *data);
 static void associatex11(struct wl_listener *listener, void *data);
@@ -482,6 +497,8 @@ static struct wlr_xwayland *xwayland;
 
 /* attempt to encapsulate suck into one file */
 #include "client.h"
+
+#include "simple_scratchpad.c"
 
 /* function implementations */
 void
@@ -1378,10 +1395,20 @@ void
 destroynotify(struct wl_listener *listener, void *data)
 {
 	/* Called when the xdg_toplevel is destroyed. */
-	Client *c = wl_container_of(listener, c, destroy);
+	Client *sc, *c = wl_container_of(listener, c, destroy);
 	wl_list_remove(&c->destroy.link);
 	wl_list_remove(&c->set_title.link);
 	wl_list_remove(&c->fullscreen.link);
+	/* Check if destroyed client was part of scratchpad_clients
+	 * and clean it from the list if so. */
+	if (c && wl_list_length(&scratchpad_clients) > 0) {
+		wl_list_for_each(sc, &scratchpad_clients, link_temp) {
+			if (sc == c) {
+				wl_list_remove(&c->link_temp);
+				break;
+			}
+		}
+	}
 #ifdef XWAYLAND
 	if (c->type != XDGShell) {
 		wl_list_remove(&c->activate.link);
@@ -1584,47 +1611,164 @@ focusstack(const Arg *arg)
 	focusclient(c, 1);
 }
 
-void focusdir(const Arg *arg)
+Vector
+position_of_box(const struct wlr_box *box)
 {
-	/* Focus the left, right, up, down client relative to the current focused client on selmon */
-  Client *c, *sel = focustop(selmon);
-	if (!sel || sel->isfullscreen)
+	return (Vector){
+		.x = box->x + box->width / 2,
+		.y = box->y + box->height / 2,
+	};
+}
+
+Vector
+diff_of_vectors(Vector *a, Vector *b)
+{
+	return (Vector){
+		.x = b->x - a->x,
+		.y = b->y - a->y,
+	};
+}
+
+const char *
+direction_of_vector(Vector *vector)
+{
+	// A zero length vector has no direction
+	if (vector->x == 0 && vector->y == 0) return "";
+
+	if (abs(vector->y) > abs(vector->x)) {
+		// Careful: We are operating in a Y-inverted coordinate system.
+		return (vector->y > 0) ? "bottom" : "top";
+	} else {
+		return (vector->x > 0) ? "right" : "left";
+	}
+}
+
+uint32_t
+vector_length(Vector *vector)
+{
+	// Euclidean distance formula
+	return (uint32_t)sqrt(vector->x * vector->x + vector->y * vector->y);
+}
+
+// Spatial direction, based on focused client position.
+Client *
+client_in_direction(const char *direction, const int *skipfloat)
+{
+	Client *cfocused = focustop(selmon);
+	Vector cfocusedposition;
+	Client *ctarget = NULL;
+	double targetdistance = INFINITY;
+	Client *c;
+
+	if (!cfocused || cfocused->isfullscreen || (skipfloat && cfocused->isfloating))
+		return NULL;
+
+	cfocusedposition = position_of_box(&cfocused->geom);
+
+	wl_list_for_each(c, &clients, link) {
+		Vector cposition;
+		Vector positiondiff;
+		uint32_t distance;
+
+		if (c == cfocused)
+			continue;
+
+		if (skipfloat && c->isfloating)
+			continue;
+
+		if (!VISIBLEON(c, selmon))
+			continue;
+
+		cposition = position_of_box(&c->geom);
+		positiondiff = diff_of_vectors(&cfocusedposition, &cposition);
+
+		if (strcmp(direction, direction_of_vector(&positiondiff)) != 0)
+			continue;
+
+		distance = vector_length(&positiondiff);
+
+		 if (distance < targetdistance) {
+			ctarget = c;
+			targetdistance = distance;
+		}
+	}
+
+	return ctarget;
+}
+
+
+void
+focusdir(const Arg *arg)
+{
+	Client *c = NULL;
+
+	if (arg->ui == 0)
+		c = client_in_direction("left", (int *)0);
+	if (arg->ui == 1)
+		c = client_in_direction("right", (int *)0);
+	if (arg->ui == 2)
+		c = client_in_direction("top", (int *)0);
+	if (arg->ui == 3)
+		c = client_in_direction("bottom", (int *)0);
+
+	if (c != NULL)
+		focusclient(c, 1);
+}
+
+void
+wl_list_swap(struct wl_list *list1, struct wl_list *list2)
+{
+	struct wl_list *prev1, *next1, *prev2, *next2;
+	struct wl_list temp;
+
+	if (list1 == list2) {
+		// No need to swap the same list
+		return;
+	}
+
+	// Get the lists before and after list1
+	prev1 = list1->prev;
+	next1 = list1->next;
+
+	// Get the lists before and after list2
+	prev2 = list2->prev;
+	next2 = list2->next;
+
+	// Update the next and previous pointers of adjacent lists
+	prev1->next = list2;
+	next1->prev = list2;
+	prev2->next = list1;
+	next2->prev = list1;
+
+	// Swap the next and previous pointers of the lists to actually swap them
+	temp = *list1;
+	*list1 = *list2;
+	*list2 = temp;
+}
+
+void
+swapdir(const Arg *arg)
+{
+	Client *c = NULL;
+	Client *cfocused;
+
+	if (arg->ui == 0)
+		c = client_in_direction("left", (int *)1);
+	if (arg->ui == 1)
+		c = client_in_direction("right", (int *)1);
+	if (arg->ui == 2)
+		c = client_in_direction("top", (int *)1);
+	if (arg->ui == 3)
+		c = client_in_direction("bottom", (int *)1);
+
+	if (c == NULL)
 		return;
 
-  int dist=INT_MAX;
-  Client *newsel = NULL;
-  int newdist=INT_MAX;
-  wl_list_for_each(c, &clients, link) {
-    if (!VISIBLEON(c, selmon))
-      continue; /* skip non visible windows */
-
-    if (arg->ui == 0 && sel->geom.x <= c->geom.x) {
-      /* Client isn't on our left */
-      continue;
-    }
-    if (arg->ui == 1 && sel->geom.x >= c->geom.x) {
-      /* Client isn't on our right */
-      continue;
-    }
-    if (arg->ui == 2 && sel->geom.y <= c->geom.y) {
-      /* Client isn't above us */
-      continue;
-    }
-    if (arg->ui == 3 && sel->geom.y >= c->geom.y) {
-      /* Client isn't below us */
-      continue;
-    }
-
-    dist=abs(sel->geom.x-c->geom.x)+abs(sel->geom.y-c->geom.y);
-    if (dist < newdist){
-      newdist = dist;
-      newsel=c;
-    }
-  }
-  if (newsel != NULL){
-    focusclient(newsel, 1);
-  }
+	cfocused = focustop(selmon);
+	wl_list_swap(&cfocused->link, &c->link);
+	arrange(selmon);
 }
+
 
 
 /* We probably should change the name of this: it sounds like it
@@ -1680,6 +1824,56 @@ handlesig(int signo)
 		while (waitpid(-1, NULL, WNOHANG) > 0);
 	else if (signo == SIGINT || signo == SIGTERM)
 		quit(NULL);
+}
+
+void
+gaplessgrid(Monitor *m)
+{
+	int n = 0, i = 0, ch, cw, cn, rn, rows, cols;
+	Client *c;
+
+	wl_list_for_each(c, &clients, link)
+		if (VISIBLEON(c, m) && !c->isfloating)
+			n++;
+	if (n == 0)
+		return;
+
+	/* grid dimensions */
+	for (cols = 0; cols <= (n / 2); cols++)
+		if ((cols * cols) >= n)
+			break;
+
+	if (n == 5) /* set layout against the general calculation: not 1:2:2, but 2:3 */
+		cols = 2;
+
+	/* widescreen is better if 3 columns */
+	if (n >= 3 && n <= 6 && (m->w.width / m->w.height) > 1)
+		cols = 3;
+
+	rows = n / cols;
+
+	/* window geometries */
+	cw = cols ? m->w.width / cols : m->w.width;
+	cn = 0; /* current column number */
+	rn = 0; /* current row number */
+	wl_list_for_each(c, &clients, link) {
+		unsigned int cx, cy;
+		if (!VISIBLEON(c, m) || c->isfloating || c->isfullscreen)
+			continue;
+
+		if ((i / rows + 1) > (cols - n % cols))
+			rows = n / cols + 1;
+		ch = rows ? m->w.height / rows : m->w.height;
+		cx = m->w.x + cn * cw;
+		cy = m->w.y + rn * ch;
+		resize(c, (struct wlr_box) { cx, cy, cw, ch}, 0);
+		rn++;
+		if (rn >= rows) {
+			rn = 0;
+			cn++;
+		}
+		i++;
+	}
 }
 
 void
@@ -1901,7 +2095,11 @@ mapnotify(struct wl_listener *listener, void *data)
 	c->geom.height += 2 * c->bw;
 
 	/* Insert this client into client lists. */
-	wl_list_insert(&clients, &c->link);
+	if (clients.prev)
+		// tile at the bottom
+		wl_list_insert(clients.prev, &c->link);
+	else
+		wl_list_insert(&clients, &c->link);
 	wl_list_insert(&fstack, &c->flink);
 
 	/* Set initial monitor, tags, floating status, and focus:
@@ -2455,11 +2653,21 @@ setcursorshape(struct wl_listener *listener, void *data)
 void
 setfloating(Client *c, int floating)
 {
-	Client *p = client_get_parent(c);
+	Client *sc, *p = client_get_parent(c);
 	c->isfloating = floating;
 	/* If in floating layout do not change the client's layer */
 	if (!c->mon || !client_surface(c)->mapped || !c->mon->lt[c->mon->sellt]->arrange)
 		return;
+	/* Check if unfloated client was part of scratchpad_clients
+	 * and remove it from scratchpad_clients list if so */
+	if (!floating && wl_list_length(&scratchpad_clients) > 0) {
+		wl_list_for_each(sc, &scratchpad_clients, link_temp) {
+			if (sc == c) {
+				wl_list_remove(&c->link_temp);
+				break;
+			}
+		}
+	}
 	wlr_scene_node_reparent(&c->scene->node, layers[c->isfullscreen ||
 			(p && p->isfullscreen) ? LyrFS
 			: c->isfloating ? LyrFloat : LyrTile]);
@@ -2677,6 +2885,7 @@ setup(void)
 	 */
 	wl_list_init(&clients);
 	wl_list_init(&fstack);
+	wl_list_init(&scratchpad_clients);
 
 	xdg_shell = wlr_xdg_shell_create(dpy, 6);
 	wl_signal_add(&xdg_shell->events.new_toplevel, &new_xdg_toplevel);
