@@ -1,6 +1,5 @@
 TODO:
 1. Modify focusdir to switch monitors and tags also, modify it to move/swap clients
-2. Find a proper layout
 
 dwl can be run on any of the backends supported by wlroots. This means you can
 run it as a separate window inside either an X11 or Wayland session, as well as
