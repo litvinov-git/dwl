@@ -374,6 +374,7 @@ static void urgent(struct wl_listener *listener, void *data);
 static void view(const Arg *arg);
 static void virtualkeyboard(struct wl_listener *listener, void *data);
 static void virtualpointer(struct wl_listener *listener, void *data);
+static void warpcursor(const Client *c);
 static Monitor *xytomon(double x, double y);
 static void xytonode(double x, double y, struct wlr_surface **psurface,
 		Client **pc, LayerSurface **pl, double *nx, double *ny);
@@ -586,6 +587,7 @@ arrange(Monitor *m)
 		m->lt[m->sellt]->arrange(m);
 	motionnotify(0, NULL, 0, 0, 0, 0);
 	checkidleinhibitor(NULL);
+	warpcursor(focustop(selmon));
 }
 
 void
@@ -1509,6 +1511,10 @@ focusclient(Client *c, int lift)
 
 	if (locked)
 		return;
+
+	/* Warp cursor to center of client if it is outside */
+	if (lift)
+		warpcursor(c);
 
 	/* Raise client in stacking order if requested */
 	if (c && lift)
@@ -2744,6 +2750,8 @@ setmon(Client *c, Monitor *m, uint32_t newtags)
 		/* Make sure window actually overlaps with the monitor */
 		resize(c, c->geom, 0);
 		c->tags = newtags ? newtags : m->tagset[m->seltags]; /* assign tags of target monitor */
+		c->prev.x = (m->w.width - c->prev.width) / 2 + m->m.x;
+		c->prev.y = (m->w.height - c->prev.height) / 2 + m->m.y;
 		setfullscreen(c, c->isfullscreen); /* This will call arrange(c->mon) */
 		setfloating(c, c->isfloating);
 	}
@@ -3502,6 +3510,27 @@ virtualpointer(struct wl_listener *listener, void *data)
 	wlr_cursor_attach_input_device(cursor, device);
 	if (event->suggested_output)
 		wlr_cursor_map_input_to_output(cursor, device, event->suggested_output);
+}
+
+void
+warpcursor(const Client *c) {
+	if (cursor_mode != CurNormal) {
+		return;
+	}
+	if (!c && selmon) {
+		wlr_cursor_warp_closest(cursor,
+			  NULL,
+			  selmon->w.x + selmon->w.width / 2.0 ,
+			  selmon->w.y + selmon->w.height / 2.0);
+	}
+	else if ( c && (cursor->x < c->geom.x ||
+		cursor->x > c->geom.x + c->geom.width ||
+		cursor->y < c->geom.y ||
+		cursor->y > c->geom.y + c->geom.height))
+		wlr_cursor_warp_closest(cursor,
+			  NULL,
+			  c->geom.x + c->geom.width / 2.0,
+			  c->geom.y + c->geom.height / 2.0);
 }
 
 Monitor *
