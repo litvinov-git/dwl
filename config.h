@@ -22,7 +22,7 @@ static const unsigned int gappov           = 10; /* vert outer gap between windo
 static const char *cursor_theme            = NULL;
 static const char cursor_size[]            = "48"; /* Make sure it's a valid integer, otherwise things will break */
 /* This conforms to the xdg-protocol. Set the alpha to zero to restore the old behavior */
-static const float fullscreen_bg[]         = {0.0f, 0.0f, 0.0f, 0.5f}; /* You can also use glsl colors */
+static const float fullscreen_bg[]         = {0.0f, 0.0f, 0.0f, 0.0f}; /* You can also use glsl colors */
 
 /* tagging - TAGCOUNT must be no greater than 31 */
 #define TAGCOUNT (9)
@@ -133,6 +133,7 @@ static const enum libinput_config_tap_button_map button_map = LIBINPUT_CONFIG_TA
 
 /* commands */
 static const char *termcmd[] = { "kitty", NULL };
+static const char *optioncmd[] = { "/home/vlitvinov/.local/bin/menu.sh", NULL };
 #define MENUCMD "fuzzel --placeholder=\"$(cat /run/user/$UID/sysinfo)\""
 static const char *editorcmd[] = { "kitty", "-e", "nvim", NULL };
 
@@ -143,6 +144,7 @@ static const Key keys[] = {
 	{ MOD4,                    XKB_KEY_a,          spawn,            SHCMD(MENUCMD) },
 	{ MOD4,                    XKB_KEY_e,          spawn,            {.v            = termcmd}             },
 	{ MOD4,                    XKB_KEY_w,          spawn,            {.v            = editorcmd}           },
+	{ MOD4,                    XKB_KEY_c,          spawn,            {.v            = optioncmd}           },
 	{ MOD1,                    XKB_KEY_a,          focusdir,         {.ui           = 0}                   },
 	{ MOD1,                    XKB_KEY_d,          focusdir,         {.ui           = 1}                   },
 	{ MOD1,                    XKB_KEY_w,          focusdir,         {.ui           = 2}                   },
